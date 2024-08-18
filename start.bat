@@ -1,3 +1,3 @@
 :a
-python main.py & pause 
+python main_en.py & pause 
 goto a
